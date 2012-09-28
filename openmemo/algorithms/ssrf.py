@@ -3,44 +3,32 @@ import logging
 from math import exp, log
 import sys
 
-from .algorithm import AlgorithmLUData, AlgorithmGlobalData, Algorithm
-
+from openmemo.algorithms.algorithm import *
 
 logger = logging.getLogger(__name__)
 
-
-class SSRFAlgorithmLUData (AlgorithmLUData):
-    """ SSRF algorithm parameters for a single learning unit. 
-    
-    Instance variables:
-    * ``grade`` - see SSRFAlgorithm documentation for allowed values
-    * ``num_reviews`` - number of review; starts from 1 for a new LU
-    * ``avg_grade`` - average grade
-    * ``priority`` - material priority; see SSRFAlgorithm documentation for allowed values
-    * ``difficulty`` - how this LU compares to an ideal LU
-    """
-
-    def __init__(self, lu, *args, **kwargs):
-        super(SSRFAlgorithmLUData, self).__init__(lu, *args, **kwargs)
-
-        self.grade = None        
-        self.num_reviews = None
-        self.avg_grade = None
-        self.priority = None
-        self.difficulty = None
-
-    def __str__(self):
-        return "grade: %(grade)s, num_reviews: %(num_reviews)d, \
+##class SSRFAlgorithmLUData (Bunch):
+#    """ SSRF algorithm parameters for a single learning unit.
+#
+#    Instance variables:
+#    * ``grade`` - see SSRFAlgorithm documentation for allowed values
+#    * ``num_reviews`` - number of review; starts from 1 for a new LU
+#    * ``avg_grade`` - average grade
+#    * ``priority`` - material priority; see SSRFAlgorithm documentation for allowed values
+#    * ``difficulty`` - how this LU compares to an ideal LU
+#    """
+def format_ssrf_data(alg_data):
+    return "grade: %(grade)s, num_reviews: %(num_reviews)d, \
 avg_grade: %(avg_grade).2f, priority: %(priority)1.1f, \
 difficulty: %(difficulty).2f, status: %(status)s" % \
-            {"grade": self.grade, "num_reviews": self.num_reviews,
-             "avg_grade": self.avg_grade, "priority": self.priority, 
-             "difficulty": self.difficulty, "status": self.status}
+        {"grade": self.grade, "num_reviews": self.num_reviews,
+         "avg_grade": self.avg_grade, "priority": self.priority,
+         "difficulty": self.difficulty, "status": self.status}
 
 class SSRFAlgorithmGlobalData (AlgorithmGlobalData):
     """ Interface implemented by global LU data provider for the SSRF algorithm. """
     
-    def get_workloads(self, from_date, to_date):
+    def get_workloads(self, from_date, to_date, user_data):
         """ Returns a list with number of items scheduled between from and to date. 
         
         The number of workloads must be equal to the number of days between ``from_date`` and ``to_date``.
@@ -240,34 +228,36 @@ class SSRFAlgorithm (Algorithm):
     
     Priority of material P = 3.0 (alternative value, not used in this implementation - average priority of all items)
     """
-    
-    GRADES = (0, 1, 2, 3, 4, 5)
-    
-    MIN_GRADE = GRADES[0]
-    MAX_GRADE = GRADES[len(GRADES) - 1]
     FINAL_DRILL_GRADES = (0, 1, 2)
 
-    PRIORITY_LOW = 2.0
-    PRIORITY_MID = 3.0
-    PRIORITY_HIGH = 4.0
-    
-    PRIORITIES = (PRIORITY_LOW, PRIORITY_MID, PRIORITY_HIGH)
-    
+    _PRIORITY_MAP = {
+        PRIORITY_LOW: 2.0,
+        PRIORITY_MEDIUM: 3.0,
+        PRIORITY_HIGH: 4.0
+    }
+
     _DEFAULT_AVG_GRADE = 2.5
-    _DEFAULT_PRIORITY = PRIORITY_MID
     
     def __init__(self, global_data, *args, **kwargs):
         super(SSRFAlgorithm, self).__init__(global_data, *args, **kwargs)
-        
-    def schedule(self, lu_data, now=None):
-        """ Calculates next repetion for a LU and sets ``next_review`` field. 
+
+    def schedule(self, grade, alg_data=None, priority=DEFAULT_PRIORITY, now=None, estimated=False, user_data=None):
+        """ Calculates next repetition for a LU and sets ``next_review`` field.
         
         See the class docstring for an exact description of the scheduling algorithm. 
         """
-        logger.debug("Input LU data: %s", lu_data)
+        if alg_data is None:
+            alg_data = {}
+        else:
+            alg_data = alg_data.copy()
+        alg_data = self._fill_initial_algorithm_data(alg_data)
+
+        logger.debug("Input LU data: %s", alg_data)
         
         # Check preconditions
-        self._assert_lu_data(lu_data)
+        self._assert_grade(grade)
+        self._assert_priority(priority)
+        self._assert_alg_data(alg_data)
         
         if now is None:
             now = datetime.utcnow()
@@ -275,35 +265,57 @@ class SSRFAlgorithm (Algorithm):
 
         # If the LU status is FINAL_DRILL, it is already scheduled.
         # Update simply it's status depending on the current grade
-        if lu_data.status == AlgorithmLUData.LUStatus.FINAL_DRILL:
-            self._update_lu_data_status(lu_data)
-            lu_data.last_review = now
-            logger.debug("Output LU data: %s", lu_data)
+        if alg_data['status'] == FINAL_DRILL:
+            self._update_alg_data_status(alg_data, grade)
+            logger.debug("Output LU data: %s", alg_data)
+            alg_data['last_review'] = now
+            return alg_data['next_review'], alg_data
 
-            return
-                
-        # Calculate minimum and maximum acceptable repetion intervals
-        min_interval = self._calculate_interval(lu_data.num_reviews,
-                                                lu_data.avg_grade,
-                                                lu_data.grade - 1,
-                                                lu_data.priority)
-        max_interval = self._calculate_interval(lu_data.num_reviews,
-                                                lu_data.avg_grade,
-                                                lu_data.grade,
-                                                lu_data.priority)
+        last_review = alg_data.get('last_review')
+        if last_review and last_review >= now - timedelta(hours=12):
+            logger.debug("Already reviewed within 12h")
+            alg_data['last_review'] = now
+            return alg_data['next_review'], alg_data
+
+        # Calculate maximum acceptable repetion interval
+        max_interval = self._calculate_interval(alg_data['num_reviews'],
+            alg_data['avg_grade'], grade, priority)
+        if estimated:
+            ideal_interval = max_interval
+        else:
+            ideal_interval = self._find_ideal_interval_balancing_workload(alg_data, grade, max_interval, priority, today,
+                user_data)
+
+        # Set a new schedule date based on the ideal interval
+        next_review = datetime.combine(today + timedelta(ideal_interval), now.time())
+
+        # Update LU algorithm parameters
+        self._update_alg_data_after_scheduling(alg_data, now, ideal_interval, grade, priority, next_review)
+        self._update_alg_data_status(alg_data, grade)
+
+        logger.debug("Output algorithm data: %s", alg_data)
+        
+        # Check postconditions
+        self._assert_alg_data(alg_data)
+
+        return AlgorithmResult(next_review, alg_data)
+
+    def _find_ideal_interval_balancing_workload(self, alg_data, grade, max_interval, priority, today, user_data):
+        # Calculate minimum acceptable repetition interval
+        min_interval = self._calculate_interval(alg_data['num_reviews'],
+            alg_data['avg_grade'], grade - 1, priority)
         logger.debug("Min/max acceptable intervals: %d/%d", min_interval, max_interval)
-        assert min_interval <= max_interval, \
-            "min. interval %s > max. interval %s" % (min_interval, max_interval)
+        assert min_interval <= max_interval,\
+        "min. interval %s > max. interval %s" % (min_interval, max_interval)
 
         # Get daily workloads for dates between min. and max. interval
-        date_from = today + timedelta(min_interval) 
-        date_to = today + timedelta(max_interval) 
-        workloads = self.global_data.get_workloads(date_from, date_to)
-        logger.debug("Workloads (from/to: %s/%s): %s", 
-                     date_from, date_to, workloads)
-        assert len(workloads) == max_interval - min_interval + 1, \
+        date_from = today + timedelta(min_interval)
+        date_to = today + timedelta(max_interval)
+        workloads = self.global_data.get_workloads(date_from, date_to, user_data)
+        logger.debug("Workloads (from/to: %s/%s): %s", date_from, date_to, workloads)
+        assert len(workloads) == max_interval - min_interval + 1,\
             "Workloads length doesn't match the number of days between min. and max. interval"
-        
+
         # Check if there is a day with no workload
         zero_workload_ind = self._find_last_zero_workload_ind(workloads)
         if zero_workload_ind != None:
@@ -312,35 +324,23 @@ class SSRFAlgorithm (Algorithm):
         else:
             # Get daily difficulties for dates between min. and max. interval
             avg_difficulties = self.global_data.get_avg_difficulties(date_from, date_to)
-            logger.debug("Avg. difficulties (from/to: %s/%s): %s", 
-                         date_from, date_to, avg_difficulties)
-            assert len(avg_difficulties) == len(workloads), \
-                "Avg. difficulties length doesn't match the workloads length"
+            logger.debug("Avg. difficulties (from/to: %s/%s): %s",
+                date_from, date_to, avg_difficulties)
+            assert len(avg_difficulties) == len(workloads),\
+            "Avg. difficulties length doesn't match the workloads length"
 
             # Find the ideal interval with the maximum load reduction
-            max_load_reduction_ind = self._find_max_load_reduction_ind(lu_data,
-                                                                       range(min_interval, max_interval + 1), 
-                                                                       workloads, 
-                                                                       avg_difficulties)
+            max_load_reduction_ind = self._find_max_load_reduction_ind(alg_data,
+                range(min_interval, max_interval + 1),
+                workloads,
+                avg_difficulties, priority)
             ideal_interval = min_interval + max_load_reduction_ind
-
+        assert min_interval <= ideal_interval <= max_interval,\
+        "ideal interval should be between min. and max. interval"
         logger.debug("Ideal interval: %d", ideal_interval)
-        
-        # Update LU algorithm parameters
-        self._update_lu_data_after_scheduling(lu_data, ideal_interval)
-        self._update_lu_data_status(lu_data)
-        
-        # Set a new schedule date based on the ideal interval
-        lu_data.last_review = now
-        lu_data.next_review = datetime.combine(today + timedelta(ideal_interval), now.time())
-        
-        logger.debug("Output LU data: %s", lu_data)
-        
-        # Check postconditions
-        self._assert_lu_data(lu_data)
-        assert min_interval <= ideal_interval <= max_interval, \
-            "ideal interval should be between min. and max. interval"
-    
+        return ideal_interval
+
+
     def _calculate_interval(self, num_reviews, prev_avg_grade, grade, priority):
         """ Calculates a maximum acceptable value of inter-repetition interval (SSRF). 
          
@@ -349,13 +349,14 @@ class SSRFAlgorithm (Algorithm):
         # Check preconditions
         self._assert_num_reviews(num_reviews)
         self._assert_avg_grade(prev_avg_grade)
-        assert grade in (SSRFAlgorithm.MIN_GRADE - 1,) + SSRFAlgorithm.GRADES, \
+        assert grade in (MIN_GRADE - 1,) + GRADES, \
             "grade %s should be -1 or one of allowed grades" % grade
         self._assert_priority(priority)
         
-        overlearning_factor = 1;
+        overlearning_factor = 1
         base_interval = num_reviews ** (prev_avg_grade / 2.0)
-        scale_factor = exp(grade - priority)
+        ssrf_priority = self._PRIORITY_MAP[priority]
+        scale_factor = exp(grade - ssrf_priority)
         interval = overlearning_factor + int(round(base_interval * scale_factor))
         
         # Check postconditions
@@ -383,12 +384,12 @@ class SSRFAlgorithm (Algorithm):
 
         return last_zero_workload_ind
         
-    def _find_max_load_reduction_ind(self, lu_data, intervals, workloads, avg_difficulties):
+    def _find_max_load_reduction_ind(self, alg_data, intervals, workloads, avg_difficulties, priority):
         """ Finds an index of the maximum load reduction in case the repetition 
         of the current LU was added to the schedule described with workloads and avg. difficulties.
         """
         # Check preconditions
-        self._assert_lu_data(lu_data)
+        self._assert_alg_data(alg_data)
         self._assert_intervals(intervals)
         self._assert_workloads(workloads)
         self._assert_avg_difficulties(avg_difficulties)
@@ -402,8 +403,8 @@ class SSRFAlgorithm (Algorithm):
         new_workloads = map(lambda workload: workload + 1, workloads)
         logger.debug("New workloads: %s", new_workloads)
         def new_avg_difficulty(interval, workload, avg_difficulty, new_workload):
-            new_difficulty = self._calculate_difficulty(lu_data.num_reviews, 
-                                              lu_data.priority, 
+            new_difficulty = self._calculate_difficulty(alg_data['num_reviews'],
+                                              priority,
                                               interval)
             logger.debug("New difficulty for the interval %d: %s", interval, new_difficulty)
             return (workload * avg_difficulty + new_difficulty) / new_workload 
@@ -451,33 +452,35 @@ class SSRFAlgorithm (Algorithm):
         
         return load_coeffs 
 
-    def _update_lu_data_after_scheduling(self, lu_data, ideal_interval):
+    def _update_alg_data_after_scheduling(self, alg_data, now, ideal_interval, grade, priority, next_review):
         """ Updates the LU algorithm parameters after a successful scheduling. """
         # Check preconditions
-        self._assert_lu_data(lu_data)
+        self._assert_alg_data(alg_data)
         
-        new_num_reviews = lu_data.num_reviews + 1
-        new_avg_grade = (lu_data.avg_grade * lu_data.num_reviews + lu_data.grade) / new_num_reviews  
-        new_difficulty = self._calculate_difficulty(lu_data.num_reviews, 
-                                                    lu_data.priority, 
+        new_num_reviews = alg_data['num_reviews'] + 1
+        new_avg_grade = (alg_data['avg_grade'] * alg_data['num_reviews'] + grade) / new_num_reviews
+        new_difficulty = self._calculate_difficulty(alg_data['num_reviews'],
+                                                    priority,
                                                     ideal_interval)
-        lu_data.num_reviews = new_num_reviews
-        lu_data.avg_grade = new_avg_grade
-        lu_data.difficulty = new_difficulty        
+        alg_data['num_reviews'] = new_num_reviews
+        alg_data['avg_grade'] = new_avg_grade
+        alg_data['difficulty'] = new_difficulty
+        alg_data['last_review'] = now
+        alg_data['next_review'] = next_review
 
         # Check postconditions
-        self._assert_lu_data(lu_data)
+        self._assert_alg_data(alg_data)
 
-    def _update_lu_data_status(self, lu_data):
+    def _update_alg_data_status(self, alg_data, grade):
         """ Updates the LU status depending on the last grade. 
         
         A LU can be drilled during the same learning session or can be marked
         as memorized (it will be recalled on the scheduled repetition date.
         """
-        if lu_data.grade in SSRFAlgorithm.FINAL_DRILL_GRADES:
-            lu_data.status = AlgorithmLUData.LUStatus.FINAL_DRILL
+        if grade in SSRFAlgorithm.FINAL_DRILL_GRADES:
+            alg_data['status'] = FINAL_DRILL
         else:
-            lu_data.status = AlgorithmLUData.LUStatus.MEMORIZED
+            alg_data['status'] = MEMORIZED
 
     def _calculate_difficulty(self, num_reviews, priority, last_interval):
         """ Calcuates a difficulty of a LU.
@@ -490,8 +493,8 @@ class SSRFAlgorithm (Algorithm):
         self._assert_interval(last_interval)
         
         ideal_interval = self._calculate_interval(num_reviews, 
-                                        SSRFAlgorithm.MAX_GRADE, 
-                                        SSRFAlgorithm.MAX_GRADE, 
+                                        MAX_GRADE, 
+                                        MAX_GRADE, 
                                         priority)
         difficulty = log((ideal_interval + 1.0) / (last_interval + 1.0))
         
@@ -501,29 +504,27 @@ class SSRFAlgorithm (Algorithm):
         return difficulty
 
     def _assert_grade(self, grade):
-        assert grade in SSRFAlgorithm.GRADES, \
+        assert grade in GRADES, \
             "grade %s should be one of allowed grades" % grade
     
     def _assert_num_reviews(self, num_reviews):
         assert num_reviews > 0, "number of reviews %s should be > 0" % num_reviews
     
     def _assert_avg_grade(self, avg_grade):
-        assert SSRFAlgorithm.MIN_GRADE <= avg_grade <= SSRFAlgorithm.MAX_GRADE, \
+        assert MIN_GRADE <= avg_grade <= MAX_GRADE, \
             "avg. grade %s should be between min. and max. allowed grade" % avg_grade
 
     def _assert_priority(self, priority):
-        assert priority in SSRFAlgorithm.PRIORITIES, \
+        assert priority in PRIORITIES, \
             "priority %s should be one of allowed priorities" % priority
 
     def _assert_difficulty(self, difficulty):
         assert difficulty >= 0.0, "difficulty %s should be >= 0.0" % difficulty
     
-    def _assert_lu_data(self, lu_data):
-        self._assert_grade(lu_data.grade)
-        self._assert_num_reviews(lu_data.num_reviews)
-        self._assert_avg_grade(lu_data.avg_grade)
-        self._assert_priority(lu_data.priority)
-        self._assert_difficulty(lu_data.difficulty)
+    def _assert_alg_data(self, alg_data):
+        self._assert_num_reviews(alg_data['num_reviews'])
+        self._assert_avg_grade(alg_data['avg_grade'])
+        self._assert_difficulty(alg_data['difficulty'])
 
     def _assert_interval(self, interval):
         assert interval >= 1, "interval %s should be >= 1" % interval
@@ -546,15 +547,14 @@ class SSRFAlgorithm (Algorithm):
             assert 0.0 <= load_coeff <= 1.0, \
                 "all load coefficients %s should be between 0.0 and 1.0"  % load_coeffs
 
-    def fill_initial_algorithm_lu_data(self, lu_data):
+    def _fill_initial_algorithm_data(self, alg_data=None):
         """ Fills the initial SSRF algorithm parameters for a newly created LU. """
-        lu_data.grade = SSRFAlgorithm.MIN_GRADE
-        
-        lu_data.num_reviews = 1
-        lu_data.avg_grade = SSRFAlgorithm._DEFAULT_AVG_GRADE
-        lu_data.priority = SSRFAlgorithm._DEFAULT_PRIORITY
-        lu_data.difficulty = 0.0
-        lu_data.status = AlgorithmLUData.LUStatus.MEMORIZED
+        alg_data = alg_data if alg_data is not None else {}
+        alg_data.setdefault('num_reviews', 1)
+        alg_data.setdefault('avg_grade', SSRFAlgorithm._DEFAULT_AVG_GRADE)
+        alg_data.setdefault('difficulty', 0.0)
+        alg_data.setdefault('status', MEMORIZED)
         
         # check postconditions
-        self._assert_lu_data(lu_data)
+        self._assert_alg_data(alg_data)
+        return alg_data
