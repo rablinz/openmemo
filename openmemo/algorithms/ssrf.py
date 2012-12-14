@@ -36,7 +36,7 @@ class SSRFAlgorithmGlobalData (AlgorithmGlobalData):
         
         raise NotImplementedError()
     
-    def get_avg_difficulties(self, from_date, to_date):
+    def get_avg_difficulties(self, from_date, to_date, user_data):
         """ Returns a list with average difficulties of items scheduled between from and to date.
         
         The number of average difficulties must be equal to the number of days between ``from_date`` and ``to_date``.
@@ -269,13 +269,13 @@ class SSRFAlgorithm (Algorithm):
             self._update_alg_data_status(alg_data, grade)
             logger.debug("Output LU data: %s", alg_data)
             alg_data['last_review'] = now
-            return alg_data['next_review'], alg_data
+            return AlgorithmResult(alg_data['next_review'], alg_data)
 
         last_review = alg_data.get('last_review')
         if last_review and last_review >= now - timedelta(hours=12):
             logger.debug("Already reviewed within 12h")
             alg_data['last_review'] = now
-            return alg_data['next_review'], alg_data
+            return AlgorithmResult(alg_data['next_review'], alg_data)
 
         # Calculate maximum acceptable repetion interval
         max_interval = self._calculate_interval(alg_data['num_reviews'],
@@ -323,7 +323,7 @@ class SSRFAlgorithm (Algorithm):
             ideal_interval = min_interval + zero_workload_ind
         else:
             # Get daily difficulties for dates between min. and max. interval
-            avg_difficulties = self.global_data.get_avg_difficulties(date_from, date_to)
+            avg_difficulties = self.global_data.get_avg_difficulties(date_from, date_to, user_data)
             logger.debug("Avg. difficulties (from/to: %s/%s): %s",
                 date_from, date_to, avg_difficulties)
             assert len(avg_difficulties) == len(workloads),\
@@ -558,3 +558,6 @@ class SSRFAlgorithm (Algorithm):
         # check postconditions
         self._assert_alg_data(alg_data)
         return alg_data
+
+    def get_difficulty(self, alg_data):
+        return alg_data['difficulty']

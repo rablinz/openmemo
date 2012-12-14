@@ -1,7 +1,7 @@
 from collections import namedtuple
 from enum import Enum
 
-AlgorithmResult = namedtuple('AlgorithmResult', 'next_review lu_data')
+AlgorithmResult = namedtuple('AlgorithmResult', 'next_review alg_data')
 
 GRADES = (0, 1, 2, 3, 4, 5)
 PRIORITY_LOW = -1
